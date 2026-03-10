@@ -30,20 +30,39 @@ export const ApplicationAuth: FunctionComponent<AuthProps> = (props: AuthProps) 
     };
 
     useEffect(() => {
-        if (auth.isOidcAuthEnabled()) {
-            auth.login("", "").then(() => {
-                console.info("[ApplicationAuth] Authentication successful.");
-                setAuthState(AuthState.AUTHENTICATED);
-            }).catch(error => {
+        // Guard against state updates after unmount while the async auth bootstrap is still running.
+        let isMounted = true;
+
+        const bootstrap = async () => {
+            try {
+                await auth.login("", "");
+
+                // Mark the app as authenticated only after the session is actually available.
+                if (isMounted && await auth.isAuthenticated()) {
+                    console.info("[ApplicationAuth] Authentication successful.");
+                    setAuthState(AuthState.AUTHENTICATED);
+                }
+            } catch (error) {
                 // TODO display the auth error
                 console.error("[ApplicationAuth] Authentication failed: ", error);
-                setAuthState(AuthState.AUTHENTICATION_FAILED);
-            });
+                if (isMounted) {
+                    setAuthState(AuthState.AUTHENTICATION_FAILED);
+                }
+            }
+        };
+
+        if (auth.isOidcAuthEnabled()) {
+            void bootstrap();
         } else if (auth.isBasicAuthEnabled()) {
             // DO NOTHING
         } else {
             setAuthState(AuthState.AUTHENTICATED);
         }
+
+        return () => {
+            // Ignore late async completions once the component is gone.
+            isMounted = false;
+        };
     }, []);
 
     return (
