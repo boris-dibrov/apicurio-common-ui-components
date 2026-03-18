@@ -10,6 +10,7 @@ import { useContext } from "react";
 const OIDC_CONFIG_OPTIONS: string[] = ["url", "clientId", "redirectUri", "scope", "logoutUrl", "loadUserInfo", "useStateBasedRedirect", "stateMaxAge", "onRedirect"];
 const OIDC_DEFAULT_SCOPES = "openid profile email";
 const SESSION_STORAGE_PREFIX = "apicurio.oidc.state.";
+const OIDC_CALLBACK_PARAM_NAMES = ["state", "code", "error", "error_description", "error_uri", "session_state", "iss"];
 const DEFAULT_STATE_MAX_AGE = 300000; // 5 minutes
 
 function only(items: string[], allOptions: any): any {
@@ -80,6 +81,19 @@ function clearRedirectLocation(stateId: string): void {
     sessionStorage.removeItem(key);
 }
 
+function clearAllRedirectLocations(): void {
+    const keysToRemove: string[] = [];
+
+    for (let i = 0; i < sessionStorage.length; i++) {
+        const key = sessionStorage.key(i);
+        if (key && key.startsWith(SESSION_STORAGE_PREFIX)) {
+            keysToRemove.push(key);
+        }
+    }
+
+    keysToRemove.forEach(key => sessionStorage.removeItem(key));
+}
+
 /**
  * Clean up expired state entries from session storage
  */
@@ -137,10 +151,40 @@ function isValidRedirectLocation(location: string): boolean {
     return true;
 }
 
+function isOidcCallbackUrl(url: URL): boolean {
+    // Only treat the URL as a callback when the provider actually returned OIDC callback params.
+    const params = url.searchParams;
+    return params.has("state") && (params.has("code") || params.has("error"));
+}
+
+function removeOidcCallbackParams(url: URL): string {
+    // Remove callback params so a regular reload is not mistaken for another callback.
+    const searchParams = new URLSearchParams(url.search);
+
+    OIDC_CALLBACK_PARAM_NAMES.forEach(param => searchParams.delete(param));
+
+    const query = searchParams.toString();
+    return `${url.pathname}${query ? `?${query}` : ""}${url.hash}`;
+}
+
+function isUserSessionValid(user: User | null | undefined): user is User {
+    // A stored user is only reusable when it still has a non-expired access token.
+    return !!user && !!user.access_token && user.expired !== true;
+}
+
+function getRedirectStateIdFromUserState(state: unknown): string | null {
+    // The callback only carries a redirect-state id, the actual route is kept in sessionStorage.
+    if (!state || typeof state !== "object") {
+        return null;
+    }
+
+    return "redirectStateId" in state && typeof state.redirectStateId === "string" ? state.redirectStateId : null;
+}
+
 let userManager: UserManager | undefined = undefined;
 let oidcConfigOptions: any;
 
-const oidc_createUserManager = (options: any): (UserManager | undefined) => {
+const oidc_createUserManager = (options: any): UserManager => {
     oidcConfigOptions = only(OIDC_CONFIG_OPTIONS, options);
 
     return new UserManager({
@@ -156,81 +200,168 @@ const oidc_createUserManager = (options: any): (UserManager | undefined) => {
     });
 };
 
-const oidc_login = async (): Promise<void> => {
+async function clearOidcAuthState(): Promise<void> {
+    // Stop silent renew first so the library does not keep retrying a broken session.
+    userManager?.stopSilentRenew();
+    clearAllRedirectLocations();
+
     try {
-        console.debug("[Auth] Logging in using OIDC");
-        const url = new URL(window.location.href);
-        const currentUser = await userManager?.getUser();
-
-        // Determine if state-based redirect is enabled (default: true)
-        const useStateBasedRedirect = oidcConfigOptions.useStateBasedRedirect !== false;
-        const stateMaxAge = oidcConfigOptions.stateMaxAge || DEFAULT_STATE_MAX_AGE;
-
-        // Clean up expired state entries
-        if (useStateBasedRedirect) {
-            cleanupExpiredStates(stateMaxAge);
-        }
-
-        // Check if this is a callback from the OIDC provider
-        if (url.searchParams.get("state") || currentUser) {
-            // Handle the callback
-            const user = await userManager?.signinRedirectCallback();
-
-            // Start silent token renewal after successful authentication
-            userManager?.startSilentRenew();
-            console.debug("[Auth] Started silent token renewal");
-
-            // If state-based redirect is enabled, navigate to stored location
-            if (useStateBasedRedirect && user?.state) {
-                const stateId = (user.state as any).redirectStateId;
-                if (stateId) {
-                    const storedLocation = getRedirectLocation(stateId);
-                    clearRedirectLocation(stateId);
-
-                    if (storedLocation && isValidRedirectLocation(storedLocation)) {
-                        console.debug(`[Auth] Redirecting to stored location: ${storedLocation}`);
-
-                        // Use custom redirect handler if provided, otherwise use window.location.href
-                        if (oidcConfigOptions.onRedirect) {
-                            oidcConfigOptions.onRedirect(storedLocation);
-                        } else {
-                            window.location.href = storedLocation;
-                        }
-                        return;
-                    } else {
-                        console.debug("[Auth] No valid stored location found, staying at current page");
-                    }
-                }
-            }
-        } else {
-            // Initiate the login
-            if (useStateBasedRedirect) {
-                // Generate state ID and store current location
-                const stateId = generateStateId();
-                const currentLocation = window.location.pathname + window.location.search + window.location.hash;
-                storeRedirectLocation(stateId, currentLocation);
-                console.debug(`[Auth] Stored redirect location: ${currentLocation} with state ID: ${stateId}`);
-
-                // Call signinRedirect with custom state
-                await userManager?.signinRedirect({
-                    state: { redirectStateId: stateId }
-                });
-            } else {
-                // Use old behavior without state-based redirect
-                await userManager?.signinRedirect();
-            }
-        }
+        // Remove the stored user so the next bootstrap cannot reuse a broken session.
+        await userManager?.removeUser();
     } catch (e) {
-        console.error("[Auth] Error logging in using OIDC: ", e);
+        console.error("[Auth] Error removing OIDC user from storage: ", e);
+    }
+
+    try {
+        // Drop transient authorize/refresh state that could poison the next login attempt.
+        await userManager?.clearStaleState();
+    } catch (e) {
+        console.error("[Auth] Error clearing stale OIDC state: ", e);
+    }
+}
+
+async function clearOidcAuthStateAndThrow(logMessage: string, error: Error): Promise<never> {
+    await clearOidcAuthState();
+    console.error(logMessage, error);
+    throw error;
+}
+
+function startOidcSilentRenew(): void {
+    // Only enable silent renew after the session has been established successfully.
+    userManager?.startSilentRenew();
+    console.debug("[Auth] Started silent token renewal");
+}
+
+function redirectToLocation(location: string): void {
+    // Let the host app handle SPA navigation when available and fall back to a hard redirect.
+    if (oidcConfigOptions.onRedirect) {
+        oidcConfigOptions.onRedirect(location);
+    } else {
+        window.location.href = location;
+    }
+}
+
+async function oidc_beginLoginRedirect(): Promise<void> {
+    console.debug("[Auth] Starting OIDC login redirect");
+    const useStateBasedRedirect = oidcConfigOptions.useStateBasedRedirect !== false;
+    const stateMaxAge = oidcConfigOptions.stateMaxAge || DEFAULT_STATE_MAX_AGE;
+
+    await userManager?.clearStaleState();
+
+    if (useStateBasedRedirect) {
+        cleanupExpiredStates(stateMaxAge);
+
+        const stateId = generateStateId();
+        const currentLocation =
+            window.location.pathname +
+            window.location.search +
+            window.location.hash;
+
+        storeRedirectLocation(stateId, currentLocation);
+        console.debug(`[Auth] Stored redirect location in session storage: ${currentLocation}`);
+
+        return userManager?.signinRedirect({
+            state: { redirectStateId: stateId }
+        });
+    }
+
+    return userManager?.signinRedirect();
+}
+
+async function oidc_handleCallback(url: URL): Promise<void> {
+    let user: User | null | undefined;
+
+    try {
+        console.debug("[Auth] Processing OIDC callback");
+
+        // Parse the provider response only for a real OIDC callback URL.
+        user = await userManager?.signinRedirectCallback();
+    } catch (e) {
+        return clearOidcAuthStateAndThrow(
+            "[Auth] Error processing OIDC callback:",
+            e instanceof Error ? e : new Error("[Auth] Error processing OIDC callback."),
+        );
+    }
+
+    if (!user) {
+        return clearOidcAuthStateAndThrow(
+            "[Auth] Error processing OIDC callback:",
+            new Error("OIDC callback completed without a user."),
+        );
+    }
+
+    startOidcSilentRenew();
+
+    const useStateBasedRedirect = oidcConfigOptions.useStateBasedRedirect !== false;
+    if (useStateBasedRedirect && user.state) {
+        const stateId = getRedirectStateIdFromUserState(user.state);
+        const storedLocation = stateId ? getRedirectLocation(stateId) : null;
+
+        if (stateId) {
+            clearRedirectLocation(stateId);
+        }
+
+        if (storedLocation && isValidRedirectLocation(storedLocation)) {
+            console.debug(`[Auth] Redirecting to stored location: ${storedLocation}`);
+            return redirectToLocation(storedLocation);
+        }
+
+        console.debug("[Auth] No valid stored location found after OIDC callback");
+    }
+
+    // If the app stays on the callback route, remove OIDC params from the address bar.
+    const cleanLocation = removeOidcCallbackParams(url);
+    window.history.replaceState({}, document.title, cleanLocation);
+}
+
+const oidc_login = async (): Promise<void> => {
+    console.debug("[Auth] Bootstrapping OIDC authentication");
+    const url = new URL(window.location.href);
+
+    if (isOidcCallbackUrl(url)) {
+        return oidc_handleCallback(url);
+    }
+
+    const currentUser = await userManager?.getUser();
+
+    if (!currentUser) {
+        return oidc_beginLoginRedirect();
+    }
+
+    if (isUserSessionValid(currentUser)) {
+        console.debug("[Auth] Reusing stored OIDC user");
+        return startOidcSilentRenew();
+    }
+
+    try {
+        console.debug("[Auth] Stored OIDC user is expired or invalid, attempting refresh");
+        await oidc_refresh();
+
+        startOidcSilentRenew();
+    } catch (e) {
+        console.warn("[Auth] OIDC refresh failed during bootstrap, starting a new login redirect", e);
+        return oidc_beginLoginRedirect();
     }
 };
 
 const oidc_refresh = async (): Promise<void> => {
     try {
         console.debug("[Auth] Refreshing token using OIDC");
-        await userManager?.signinSilent();
+
+        const user = await userManager?.signinSilent();
+
+        if (!isUserSessionValid(user)) {
+            // Treat a refresh result without a valid user as a hard failure.
+            return clearOidcAuthStateAndThrow(
+                "[Auth] Error refreshing token using OIDC:",
+                new Error("OIDC silent refresh returned no valid user."),
+            );
+        }
     } catch (e) {
-        console.error("[Auth] Error refreshing token using OIDC: ", e);
+        return clearOidcAuthStateAndThrow(
+            "[Auth] Error refreshing token using OIDC:",
+            e instanceof Error ? e : new Error("[Auth] Error refreshing token using OIDC."),
+        );
     }
 };
 
@@ -247,7 +378,9 @@ const oidc_logout = async (): Promise<void> => {
 };
 
 const oidc_isAuthenticated = async (): Promise<boolean> => {
-    return await userManager?.getUser() != null;
+    // Only expose the session as authenticated while the stored token is still usable.
+    const user = await userManager?.getUser();
+    return isUserSessionValid(user);
 };
 
 const oidc_getAccessToken = async (): Promise<string> => {
